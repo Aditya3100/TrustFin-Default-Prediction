@@ -1,0 +1,16 @@
+{
+  "best_model": "lightgbm",
+  "roc_auc": 0.778635000523848,
+  "n_features": 169,
+  "all_results": {
+    "logistic_regression": {
+      "auc": 0.7645840384620248
+    },
+    "xgboost": {
+      "auc": 0.7779195266793266
+    },
+    "lightgbm": {
+      "auc": 0.778635000523848
+    }
+  }
+}

@@ -1,0 +1,23 @@
+artifact_path: /Users/adi/project/Home-Credit-Default-Risk/mlruns/1/models/m-f8e2ce55de7e467d928c6b1a9a74a2c9/artifacts
+flavors:
+  python_function:
+    env:
+      conda: conda.yaml
+      virtualenv: python_env.yaml
+    loader_module: mlflow.sklearn
+    model_path: model.pkl
+    predict_fn: predict
+    python_version: 3.12.10
+  sklearn:
+    code: null
+    pickled_model: model.pkl
+    serialization_format: cloudpickle
+    sklearn_version: 1.9.0
+    skops_trusted_types: null
+mlflow_version: 3.14.0
+model_id: m-f8e2ce55de7e467d928c6b1a9a74a2c9
+model_size_bytes: 3517318
+model_uuid: m-f8e2ce55de7e467d928c6b1a9a74a2c9
+prompts: null
+run_id: a8d9800fd84140a090ce8391b974955e
+utc_time_created: '2026-06-28 17:26:36.956807'
