@@ -94,7 +94,19 @@ class LoanRiskPredictor:
     def __init__(self, models_dir: Union[str, Path] = Path("models"),
                  threshold: float = 0.5):
         self.models_dir = Path(models_dir)
-        self.threshold  = threshold
+        
+        meta_path = self.models_dir / "model_meta.json"
+        self._meta = {}
+        if meta_path.exists():
+            with open(meta_path, "r") as f:
+                self._meta = json.load(f)
+        
+        # Load threshold from metadata if available, otherwise use passed threshold
+        self.threshold = threshold
+        if "optimal_threshold" in self._meta:
+            self.threshold = self._meta["optimal_threshold"]
+            logger.info("Using optimal threshold from model metadata: %.2f", self.threshold)
+            
         self._model        = None
         self._preprocessor = None
         self._feature_list: List[str] = []
@@ -102,20 +114,42 @@ class LoanRiskPredictor:
 
     # ------------------------------------------------------------------
     def _load_artefacts(self) -> None:
-        model_path = self.models_dir / "model.pkl"
-        prep_path  = self.models_dir / "preprocessing.pkl"
-        feat_path  = self.models_dir / "feature_list.pkl"
+        model_lr_path = self.models_dir / "model_lr.pkl"
+        model_xgb_path = self.models_dir / "model_xgb.pkl"
+        model_lgb_path = self.models_dir / "model_lgb.pkl"
+        knn_path       = self.models_dir / "knn_transformer.pkl"
+        prep_path      = self.models_dir / "preprocessing.pkl"
+        feat_path      = self.models_dir / "feature_list.pkl"
 
-        for p in [model_path, prep_path, feat_path]:
+        for p in [prep_path, feat_path]:
             if not p.exists():
                 raise FileNotFoundError(
                     f"Required artefact not found: {p}\n"
                     "Run src/train.py first to generate model artefacts."
                 )
 
-        with open(model_path,  "rb") as f: self._model        = pickle.load(f)
         with open(prep_path,   "rb") as f: self._preprocessor = pickle.load(f)
         with open(feat_path,   "rb") as f: self._feature_list = pickle.load(f)
+        
+        self.ensemble = False
+        if model_lr_path.exists() and model_xgb_path.exists() and model_lgb_path.exists():
+            with open(model_lr_path, "rb") as f: self._model_lr = pickle.load(f)
+            with open(model_xgb_path, "rb") as f: self._model_xgb = pickle.load(f)
+            with open(model_lgb_path, "rb") as f: self._model_lgb = pickle.load(f)
+            self.ensemble = True
+            logger.info("Loaded ensemble models (LR, XGB, LGB).")
+        else:
+            model_path = self.models_dir / "model.pkl"
+            if not model_path.exists():
+                raise FileNotFoundError(f"Champion model not found at {model_path}")
+            with open(model_path,  "rb") as f: self._model = pickle.load(f)
+            logger.info("Loaded single champion model.")
+
+        if knn_path.exists():
+            with open(knn_path, "rb") as f: self._knn_transformer = pickle.load(f)
+            logger.info("Loaded KNN neighborhood target mean transformer.")
+        else:
+            self._knn_transformer = None
         logger.info("Artefacts loaded from %s", self.models_dir)
 
     # ------------------------------------------------------------------
@@ -199,10 +233,23 @@ class LoanRiskPredictor:
         fe = FeatureEngineer()
         df_fe = fe.transform(df_clean)
 
+        # Compute neighbor target mean feature if transformer is present
+        if self._knn_transformer is not None:
+            df_fe['NEIGHBOR_TARGET_MEAN'] = self._knn_transformer.transform(df_fe, is_train=False)
+
         # Align to training feature list
         X = df_fe.reindex(columns=self._feature_list, fill_value=0)
 
-        probs = self._model.predict_proba(X)[:, 1]
+        if self.ensemble:
+            probs_lr = self._model_lr.predict_proba(X)[:, 1]
+            probs_xgb = self._model_xgb.predict_proba(X)[:, 1]
+            probs_lgb = self._model_lgb.predict_proba(X)[:, 1]
+            
+            # Weighted average based on metadata
+            weights = self._meta.get("ensemble_weights", [0.1, 0.4, 0.5])
+            probs = weights[0] * probs_lr + weights[1] * probs_xgb + weights[2] * probs_lgb
+        else:
+            probs = self._model.predict_proba(X)[:, 1]
 
         results = []
         for i, prob in enumerate(probs):

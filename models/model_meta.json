@@ -1,16 +1,25 @@
 {
-  "best_model": "lightgbm",
-  "roc_auc": 0.778635000523848,
-  "n_features": 169,
+  "best_model": "ensemble",
+  "roc_auc": 0.7856436493068659,
+  "n_features": 144,
+  "optimal_threshold": 0.67,
+  "ensemble_weights": [
+    0.1,
+    0.4,
+    0.5
+  ],
   "all_results": {
     "logistic_regression": {
-      "auc": 0.7645840384620248
+      "auc": 0.7683202676709623
     },
     "xgboost": {
-      "auc": 0.7779195266793266
+      "auc": 0.7747362867789118
     },
     "lightgbm": {
-      "auc": 0.778635000523848
+      "auc": 0.7733115487240476
+    },
+    "ensemble": {
+      "auc": 0.7856436493068659
     }
   }
 }

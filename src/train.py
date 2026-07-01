@@ -36,8 +36,8 @@ import mlflow.sklearn
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, f1_score
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from xgboost import XGBClassifier
 
 from preprocessing import PreprocessingPipeline
@@ -140,8 +140,15 @@ def load_data(data_dir: Path) -> pd.DataFrame:
             PREV_AVG_DOWN_PAYMENT=("AMT_DOWN_PAYMENT", "mean"),
             PREV_APPROVAL_RATE=(   "NAME_CONTRACT_STATUS", lambda x: (x == "Approved").mean()),
         ).reset_index()
+
+        # Add lag features
+        from feature_engineering import compute_prev_application_lag_features
+        lag_features = compute_prev_application_lag_features(prev)
+        if not lag_features.empty:
+            prev_agg = prev_agg.merge(lag_features, on=ID_COL, how="left")
+
         df = df.merge(prev_agg, on=ID_COL, how="left")
-        logger.info("Merged previous_application data.")
+        logger.info("Merged previous_application data (with lag features).")
 
     # ---------- POS_CASH_balance ---------------------------------------------
     pos_path = data_dir / "POS_CASH_balance.csv"
@@ -168,9 +175,17 @@ def load_data(data_dir: Path) -> pd.DataFrame:
             INSTALL_MAX_LATE_DAYS=(    "DAYS_LATE",     "max"),
             INSTALL_MISSED_PAYMENTS=(  "PAYMENT_DIFF",  lambda x: (x > 0).sum()),
             INSTALL_AVG_PAYMENT_DIFF=( "PAYMENT_DIFF",  "mean"),
+            INSTALL_MAX_AMT_INSTALMENT=("AMT_INSTALMENT", "max"),
         ).reset_index()
+
+        # Add temporal features
+        from feature_engineering import compute_installment_temporal_features
+        temp_features = compute_installment_temporal_features(inst)
+        if not temp_features.empty:
+            inst_agg = inst_agg.merge(temp_features, on=ID_COL, how="left")
+
         df = df.merge(inst_agg, on=ID_COL, how="left")
-        logger.info("Merged installments_payments data.")
+        logger.info("Merged installments_payments data (with temporal and max installment).")
 
     # ---------- credit_card_balance ------------------------------------------
     cc_path = data_dir / "credit_card_balance.csv"
@@ -293,54 +308,141 @@ def run_training(data_dir: Path, models_dir: Path) -> None:
     X = df_fe.drop(columns=drop_cols)
     y = df_fe[TARGET_COL]
 
-    feature_list = X.columns.tolist()
-    X_train, X_test, y_train, y_test = train_test_split(
+    X_train_full, X_test, y_train_full, y_test = train_test_split(
         X, y, test_size=TEST_SIZE, stratify=y, random_state=RANDOM_STATE
     )
-    logger.info("Train: %s  Test: %s", X_train.shape, X_test.shape)
+    logger.info("Initial Train: %s  Test: %s", X_train_full.shape, X_test.shape)
 
-    scale_pos_wt = compute_scale_pos_weight(y_train)
+    # Feature Selection using a quick LightGBM
+    import lightgbm as lgb
+    logger.info("Running LightGBM feature selection ...")
+    selector_model = lgb.LGBMClassifier(n_estimators=200, learning_rate=0.1, num_leaves=31, random_state=RANDOM_STATE, verbose=-1)
+    selector_model.fit(X_train_full, y_train_full)
+    
+    importance_df = pd.DataFrame({
+        'feature': X_train_full.columns,
+        'importance': selector_model.feature_importances_
+    }).sort_values('importance', ascending=False)
+    
+    meaningful_features = importance_df[importance_df['importance'] >= 2]['feature'].tolist()
+    logger.info("Selected %d features out of %d using LightGBM importance >= 2", len(meaningful_features), len(X_train_full.columns))
+    
+    X_train_full = X_train_full[meaningful_features]
+    X_test = X_test[meaningful_features]
+    feature_list = meaningful_features.copy()
 
-    # 5. Train models
-    model_configs = [
-        ("logistic_regression", lambda: train_logistic_regression(X_train, y_train)),
-        ("xgboost",             lambda: train_xgboost(X_train, y_train, scale_pos_wt)),
-        ("lightgbm",            lambda: train_lightgbm(X_train, y_train)),
-    ]
+    # Fit final KNN Target Mean Transformer on full train set
+    from feature_engineering import NeighborTargetMeanTransformer
+    logger.info("Fitting final KNN target mean transformer ...")
+    knn_transformer = NeighborTargetMeanTransformer(n_neighbors=500)
+    knn_transformer.fit(X_train_full, y_train_full)
 
-    results: Dict[str, Dict] = {}
+    # Compute target mean feature for test set (is_train=False) and full train set (is_train=True)
+    X_test = X_test.copy()
+    X_test['NEIGHBOR_TARGET_MEAN'] = knn_transformer.transform(X_test, is_train=False)
 
-    for name, train_fn in model_configs:
-        model = train_fn()
-        if model is None:
-            continue
+    X_train_full_final = X_train_full.copy()
+    X_train_full_final['NEIGHBOR_TARGET_MEAN'] = knn_transformer.transform(X_train_full, is_train=True)
 
-        y_prob = model.predict_proba(X_test)[:, 1]
-        auc = roc_auc_score(y_test, y_prob)
-        logger.info("%s – Test ROC-AUC: %.4f", name, auc)
-        results[name] = {"model": model, "auc": auc}
+    feature_list.append('NEIGHBOR_TARGET_MEAN')
+    logger.info("Added NEIGHBOR_TARGET_MEAN feature.")
 
-        with mlflow.start_run(run_name=name):
-            mlflow.log_params({
-                "model_type": name,
-                "train_size": len(X_train),
-                "test_size": len(X_test),
-                "n_features": len(feature_list),
-                "scale_pos_weight": round(scale_pos_wt, 2),
-            })
-            mlflow.log_metric("roc_auc", auc)
-            mlflow.sklearn.log_model(model, artifact_path="model", serialization_format="cloudpickle")
+    # 5. Stratified 5-Fold Cross Validation
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    
+    oof_preds_lr = np.zeros(len(X_train_full))
+    oof_preds_xgb = np.zeros(len(X_train_full))
+    oof_preds_lgb = np.zeros(len(X_train_full))
+    
+    logger.info("Starting Stratified 5-Fold Cross Validation ...")
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_full, y_train_full)):
+        logger.info("Fold %d ...", fold + 1)
+        X_tr, X_val = X_train_full.iloc[train_idx].copy(), X_train_full.iloc[val_idx].copy()
+        y_tr, y_val = y_train_full.iloc[train_idx], y_train_full.iloc[val_idx]
+        
+        # Fit fold KNN target mean
+        fold_knn = NeighborTargetMeanTransformer(n_neighbors=500)
+        fold_knn.fit(X_tr, y_tr)
+        
+        X_tr['NEIGHBOR_TARGET_MEAN'] = fold_knn.transform(X_tr, is_train=True)
+        X_val['NEIGHBOR_TARGET_MEAN'] = fold_knn.transform(X_val, is_train=False)
+        
+        # 1. LR
+        lr_fold = train_logistic_regression(X_tr, y_tr)
+        oof_preds_lr[val_idx] = lr_fold.predict_proba(X_val)[:, 1]
+        
+        # 2. XGBoost
+        scale_pos_wt_fold = compute_scale_pos_weight(y_tr)
+        xgb_fold = train_xgboost(X_tr, y_tr, scale_pos_wt_fold)
+        oof_preds_xgb[val_idx] = xgb_fold.predict_proba(X_val)[:, 1]
+        
+        # 3. LightGBM
+        lgb_fold = train_lightgbm(X_tr, y_tr)
+        if lgb_fold is not None:
+            oof_preds_lgb[val_idx] = lgb_fold.predict_proba(X_val)[:, 1]
 
-    # 6. Select and save best model
-    if not results:
-        raise RuntimeError("No models were trained successfully.")
+    auc_lr = roc_auc_score(y_train_full, oof_preds_lr)
+    auc_xgb = roc_auc_score(y_train_full, oof_preds_xgb)
+    auc_lgb = roc_auc_score(y_train_full, oof_preds_lgb)
+    
+    logger.info("OOF ROC-AUC Scores -- LR: %.4f, XGB: %.4f, LGB: %.4f", auc_lr, auc_xgb, auc_lgb)
 
-    best_name = max(results, key=lambda k: results[k]["auc"])
-    best_model = results[best_name]["model"]
-    logger.info("Best model: %s  AUC: %.4f", best_name, results[best_name]["auc"])
+    # Blend OOF predictions
+    w_lr, w_xgb, w_lgb = 0.1, 0.4, 0.5
+    oof_preds_blended = w_lr * oof_preds_lr + w_xgb * oof_preds_xgb + w_lgb * oof_preds_lgb
+    auc_blended = roc_auc_score(y_train_full, oof_preds_blended)
+    logger.info("Blended OOF ROC-AUC Score: %.4f", auc_blended)
 
+    # Threshold Optimization based on Blended OOF F1-macro score
+    best_threshold = 0.5
+    best_f1 = 0.0
+    thresholds = np.arange(0.1, 0.9, 0.01)
+    for t in thresholds:
+        preds = (oof_preds_blended >= t).astype(int)
+        score = f1_score(y_train_full, preds, average='macro')
+        if score > best_f1:
+            best_f1 = score
+            best_threshold = t
+    logger.info("Optimal threshold on OOF: %.2f, F1-macro: %.4f", best_threshold, best_f1)
+
+    # Train final models on full train set
+    logger.info("Fitting final models on the entire training set ...")
+    final_lr = train_logistic_regression(X_train_full_final, y_train_full)
+    final_xgb = train_xgboost(X_train_full_final, y_train_full, compute_scale_pos_weight(y_train_full))
+    final_lgb = train_lightgbm(X_train_full_final, y_train_full)
+
+    # Blend test set predictions
+    probs_lr = final_lr.predict_proba(X_test)[:, 1]
+    probs_xgb = final_xgb.predict_proba(X_test)[:, 1]
+    probs_lgb = final_lgb.predict_proba(X_test)[:, 1]
+    
+    y_prob = w_lr * probs_lr + w_xgb * probs_xgb + w_lgb * probs_lgb
+    auc = roc_auc_score(y_test, y_prob)
+    logger.info("Ensembled Test ROC-AUC: %.4f", auc)
+
+    # Log to MLflow
+    with mlflow.start_run(run_name="ensemble"):
+        mlflow.log_params({
+            "model_type": "ensemble_blend",
+            "train_size": len(X_train_full_final),
+            "test_size": len(X_test),
+            "n_features": len(feature_list),
+            "lr_weight": w_lr,
+            "xgb_weight": w_xgb,
+            "lgb_weight": w_lgb,
+            "optimal_threshold": round(best_threshold, 2),
+        })
+        mlflow.log_metric("roc_auc", auc)
+        mlflow.log_metric("oof_roc_auc", auc_blended)
+        mlflow.sklearn.log_model(final_lgb, artifact_path="model", serialization_format="cloudpickle")
+
+    # 6. Save models and preprocessing pipeline
     models_dir.mkdir(parents=True, exist_ok=True)
-    save_artefact(best_model, models_dir / "model.pkl")
+    save_artefact(final_lgb, models_dir / "model.pkl")  # production champion fallback
+    save_artefact(final_lr,  models_dir / "model_lr.pkl")
+    save_artefact(final_xgb, models_dir / "model_xgb.pkl")
+    save_artefact(final_lgb, models_dir / "model_lgb.pkl")
+    save_artefact(knn_transformer, models_dir / "knn_transformer.pkl")
     save_artefact(pipe,        models_dir / "preprocessing.pkl")
     save_artefact(feature_list,models_dir / "feature_list.pkl")
 
@@ -355,10 +457,17 @@ def run_training(data_dir: Path, models_dir: Path) -> None:
 
     # Save a metadata JSON for the prediction service
     meta = {
-        "best_model": best_name,
-        "roc_auc": results[best_name]["auc"],
+        "best_model": "ensemble",
+        "roc_auc": auc,
         "n_features": len(feature_list),
-        "all_results": {k: {"auc": v["auc"]} for k, v in results.items()},
+        "optimal_threshold": round(best_threshold, 2),
+        "ensemble_weights": [w_lr, w_xgb, w_lgb],
+        "all_results": {
+            "logistic_regression": {"auc": auc_lr},
+            "xgboost": {"auc": auc_xgb},
+            "lightgbm": {"auc": auc_lgb},
+            "ensemble": {"auc": auc}
+        }
     }
     with open(models_dir / "model_meta.json", "w") as f:
         json.dump(meta, f, indent=2)

@@ -261,11 +261,61 @@ def _parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = _parse_args()
 
-    # Load artefacts
-    with open(args.models_dir / "model.pkl", "rb") as f:
-        model = pickle.load(f)
+    # Load model_meta.json to check for ensemble and optimal threshold
+    meta_path = args.models_dir / "model_meta.json"
+    meta = {}
+    if meta_path.exists():
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+
+    # Determine default threshold
+    threshold = args.threshold
+    if threshold == 0.5 and "optimal_threshold" in meta:
+        threshold = meta["optimal_threshold"]
+        logger.info("Using optimal threshold from metadata: %.2f", threshold)
+
+    # Load feature list
     with open(args.models_dir / "feature_list.pkl", "rb") as f:
         feature_list = pickle.load(f)
+
+    # Load model(s)
+    model_lr_path = args.models_dir / "model_lr.pkl"
+    model_xgb_path = args.models_dir / "model_xgb.pkl"
+    model_lgb_path = args.models_dir / "model_lgb.pkl"
+    
+    ensemble = False
+    if model_lr_path.exists() and model_xgb_path.exists() and model_lgb_path.exists():
+        with open(model_lr_path, "rb") as f: model_lr = pickle.load(f)
+        with open(model_xgb_path, "rb") as f: model_xgb = pickle.load(f)
+        with open(model_lgb_path, "rb") as f: model_lgb = pickle.load(f)
+        ensemble = True
+        logger.info("Evaluating with ensemble (LR + XGB + LGB) ...")
+        
+        class BlendedEnsemble:
+            def __init__(self, lr, xgb, lgb, weights):
+                self.lr = lr
+                self.xgb = xgb
+                self.lgb = lgb
+                self.weights = weights
+                if hasattr(lgb, "feature_importances_"):
+                    self.feature_importances_ = lgb.feature_importances_
+                elif hasattr(lgb, "coef_"):
+                    self.coef_ = lgb.coef_
+            
+            def predict_proba(self, X):
+                p_lr = self.lr.predict_proba(X)[:, 1]
+                p_xgb = self.xgb.predict_proba(X)[:, 1]
+                p_lgb = self.lgb.predict_proba(X)[:, 1]
+                p_blend = self.weights[0] * p_lr + self.weights[1] * p_xgb + self.weights[2] * p_lgb
+                return np.column_stack([1.0 - p_blend, p_blend])
+
+        weights = meta.get("ensemble_weights", [0.1, 0.4, 0.5])
+        model = BlendedEnsemble(model_lr, model_xgb, model_lgb, weights)
+    else:
+        # Load single champion model
+        with open(args.models_dir / "model.pkl", "rb") as f:
+            model = pickle.load(f)
+        logger.info("Evaluating with single model ...")
 
     # Load test data
     df_test = pd.read_csv(args.data_path)
@@ -273,5 +323,5 @@ if __name__ == "__main__":
     y_test = df_test["TARGET"]
 
     metrics = evaluate(X_test, y_test, model, feature_list,
-                        reports_dir=args.reports_dir, threshold=args.threshold)
+                        reports_dir=args.reports_dir, threshold=threshold)
     print(json.dumps(metrics, indent=2))

@@ -312,6 +312,8 @@ class PreprocessingPipeline:
 
         df = df.copy()
         df = df.dropna(axis=1, how="all")
+        if "REGION_POPULATION_RELATIVE" in df.columns:
+            df["REGION_POPULATION_RELATIVE"] = df["REGION_POPULATION_RELATIVE"].astype(str)
 
         df, self.dropped_cols_ = drop_high_missing(df, self.high_missing_threshold)
         df = detect_duplicates(df)
@@ -336,6 +338,8 @@ class PreprocessingPipeline:
 
         df = df.copy()
         df = df.dropna(axis=1, how="all")
+        if "REGION_POPULATION_RELATIVE" in df.columns:
+            df["REGION_POPULATION_RELATIVE"] = df["REGION_POPULATION_RELATIVE"].astype(str)
         df = df.drop(columns=[c for c in self.dropped_cols_ if c in df.columns], errors="ignore")
         df = handle_sentinel_values(df, self.sentinel_map)
         df = add_history_flags(df, self.merged_prefixes)
